@@ -1,0 +1,26 @@
+Expr =
+    | Nil
+    | Int IntPtr
+    | Var IntPtr
+    | Lam Expr
+    | Def Expr Expr
+    | App Expr Expr
+    | Arr [| Expr |]
+
+reduce : Expr -> Expr
+-- Nil closure.
+reduce (App Nil b) = reduce b
+-- Beta reduction.
+reduce (App (Lam a) b) = reduce (App (Def b Nil) a)
+-- Variable lookup.
+reduce (App (Def a1 _) (Var 0)) = reduce a1
+reduce (App (Def _ a2) (Var i)) = reduce (App a2 (Var (i - 1)))
+-- Closure propagation.
+reduce (App a@(Def _ _) (Lam b)) = Lam (App a b)
+reduce (App a@(Def _ _) (Def b1 b2)) = Def (App a b1) (App a b2)
+-- Closure application.
+reduce (App a@(Def _ _) (App b1 b2)) = reduce(App (App a b1) (App a b2))
+-- Closure constant.
+reduce (App (Def _ _) b) = b
+-- Constant.
+reduce a = a
