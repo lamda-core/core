@@ -1,85 +1,123 @@
 use std::rc::Rc;
 
-// Closure calculus: https://blog.chewxy.com/wp-content/uploads/personal/dissertation31482.pdf
+// High-order VM: https://github.com/Kindelia/HVM
+// Closure calculus: https://dl.acm.org/doi/pdf/10.1145/3294032.3294085
 
-// TODO: Maybe optimization: Nil can be a null pointer.
-// TODO: Test if Box is faster than Rc.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-  Nil,
-  Int(usize),
-  Var(usize),
-  Def(Rc<Expr>, Rc<Expr>),
-  Lam(Rc<Expr>),
-  App(Rc<Expr>, Rc<Expr>),
-  Arr(Rc<Expr>, Rc<Vec<Rc<Expr>>>),
+  Nil,                     // Empty environment       _
+  Int(i64),                // Integer value           42
+  Ctr(usize),              // Constructor index       #0
+  Var(usize),              // DeBruijn variable       %0
+  App(Rc<Expr>, Rc<Expr>), // Application             a b
+  Lam(Rc<Expr>, Rc<Expr>), // Lamda closure           \env body
+  Def(Rc<Expr>, Rc<Expr>), // Environment definition  {a, b}
+  Jmp(Rc<Vec<Rc<Expr>>>),  // Jump table              [a, b]
+  Op2(BinaryOp),           // Binary operator         +
 }
 use Expr::*;
 
-// Synatx sugar.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinaryOp {
+  Add,
+  Sub,
+  Mul,
+}
+use BinaryOp::*;
+
 fn nil() -> Rc<Expr> {
   Rc::new(Nil)
 }
-fn int(n: usize) -> Rc<Expr> {
-  Rc::new(Int(n))
+fn ctr(i: usize) -> Rc<Expr> {
+  Rc::new(Ctr(i))
 }
 fn var(i: usize) -> Rc<Expr> {
   Rc::new(Var(i))
 }
-fn def(a: Rc<Expr>, env: Rc<Expr>) -> Rc<Expr> {
-  Rc::new(Def(a, env))
+fn int(i: i64) -> Rc<Expr> {
+  Rc::new(Int(i))
 }
-fn lam(a: Rc<Expr>) -> Rc<Expr> {
-  Rc::new(Lam(a))
+fn lam(env: Rc<Expr>, body: Rc<Expr>) -> Rc<Expr> {
+  Rc::new(Lam(env, body))
+}
+fn def(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+  Rc::new(Def(a, b))
 }
 fn app(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
   Rc::new(App(a, b))
 }
-fn arr(env: Rc<Expr>, array: Vec<Rc<Expr>>) -> Rc<Expr> {
-  Rc::new(Arr(env, Rc::new(array)))
+fn jmp(vec: Rc<Vec<Rc<Expr>>>) -> Rc<Expr> {
+  Rc::new(Jmp(vec))
+}
+macro_rules! jmp {
+  () => {
+    Rc::new(Jmp(Rc::new(vec![])))
+  };
+  ($($x:expr),+ $(,)?) => {
+    Rc::new(Jmp(Rc::new(vec![$($x),+])))
+  };
+}
+fn add(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+  app(app(Rc::new(Op2(Add)), a), b)
+}
+fn sub(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+  app(app(Rc::new(Op2(Sub)), a), b)
+}
+fn mul(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+  app(app(Rc::new(Op2(Mul)), a), b)
 }
 
-// TODO: Tail call optimization.
-fn reduce(expr: &Expr) -> Expr {
-  match expr {
-    App(a, b) => match reduce(a) {
-      // Nil closure.
-      Nil => reduce(b),
+fn reduce(expr: Rc<Expr>) -> Rc<Expr> {
+  match expr.as_ref() {
+    App(fun, arg) => {
+      let fun = reduce(fun.clone());
+      let arg = reduce(arg.clone());
+      match (fun.as_ref(), arg.as_ref()) {
+        (Nil, _) => reduce(arg),
+        (Var(_), _) => app(fun, arg),
+        (App(op, a), _) => match (op.as_ref(), a.as_ref(), arg.as_ref()) {
+          (Op2(Add), Int(a), Int(b)) => int(a + b),
+          (Op2(Sub), Int(a), Int(b)) => int(a - b),
+          (Op2(Mul), Int(a), Int(b)) => int(a * b),
+          _ => app(fun, arg),
+        },
+        (Lam(env, body), _) => reduce(app(def(arg, env.clone()), body.clone())),
+        (Def(x, _), Var(0)) => reduce(x.clone()),
+        (Def(_, env), Var(i)) => reduce(app(env.clone(), var(i - 1))),
+        (Def(_, _), Lam(env, body)) => lam(app(fun, env.clone()), body.clone()),
+        (Def(_, _), Def(x, env)) => def(app(fun.clone(), x.clone()), app(fun, env.clone())),
+        (Def(_, _), App(a, b)) => reduce(app(app(fun.clone(), a.clone()), app(fun, b.clone()))),
+        (Def(_, _), _) => arg,
+        (Jmp(branches), Ctr(i)) => reduce(branches[*i].clone()),
+        _ => expr,
+      }
+    }
+    _ => expr,
+  }
+}
 
-      Def(a1, a2) => match b.as_ref() {
-        // Variable lookup.
-        Var(0) => reduce(a1.as_ref()),
-        Var(i) => reduce(&App(a2.clone(), var(i - 1))),
-
-        // Closure propagation.
-        Lam(b) => Lam(app(a.clone(), b.clone())),
-        Def(b1, b2) => Def(app(a.clone(), b1.clone()), app(a.clone(), b2.clone())),
-        Arr(b, array) => Arr(app(a.clone(), b.clone()), array.clone()),
-
-        // Closure application.
-        App(b1, b2) => reduce(&App(app(a.clone(), b1.clone()), app(a.clone(), b2.clone()))),
-
-        // Closure constant.
-        b => (*b).clone(),
-      },
-
-      // Beta reduction.
-      Lam(a) => reduce(&App(def(b.clone(), nil()), a.clone())),
-
-      Arr(env, array) => match b.as_ref() {
-        // Branch.
-        Int(n) => reduce(&App(env, array[*n].clone())),
-
-        // Constant.
-        _ => expr.clone(),
-      },
-
-      // Application constant.
-      _ => expr.clone(),
-    },
-
-    // -- Constant.
-    _ => expr.clone(),
+impl Expr {
+  fn show(&self) -> String {
+    match self {
+      Nil => String::from("_"),
+      Int(i) => i.to_string(),
+      Ctr(i) => format!("#{i}"),
+      Var(i) => format!("%{i}"),
+      App(fun, arg) => format!("({} {})", fun.show(), arg.show()),
+      Lam(env, body) => format!("(\\{} {})", env.show(), body.show()),
+      Def(x, env) => format!("{{{} {}}}", x.show(), env.show()),
+      Jmp(branches) => format!(
+        "[{}]",
+        branches
+          .iter()
+          .map(|br| br.show())
+          .collect::<Vec<String>>()
+          .join(", ")
+      ),
+      Op2(Add) => String::from("+"),
+      Op2(Sub) => String::from("-"),
+      Op2(Mul) => String::from("*"),
+    }
   }
 }
 
@@ -88,83 +126,66 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_reduce_constant() {
-    assert_eq!(reduce(&Nil), Nil);
-    assert_eq!(reduce(&Int(1)), Int(1));
-    assert_eq!(reduce(&Var(0)), Var(0));
-    assert_eq!(reduce(&Def(int(1), nil())), Def(int(1), nil()));
-    assert_eq!(reduce(&Lam(var(0))), Lam(var(0)));
-    assert_eq!(reduce(&App(int(1), int(2))), App(int(1), int(2)));
+  fn test_reduce() {
+    assert_eq!(reduce(app(nil(), int(1))), int(1));
+    assert_eq!(reduce(app(int(1), int(2))), app(int(1), int(2)));
+    assert_eq!(reduce(app(var(0), int(1))), app(var(0), int(1)));
+    assert_eq!(reduce(app(var(1), int(1))), app(var(1), int(1)));
     assert_eq!(
-      reduce(&Arr(nil(), Rc::new(vec![]))),
-      Arr(nil(), Rc::new(vec![]))
+      reduce(app(app(int(1), int(2)), int(3))),
+      app(app(int(1), int(2)), int(3))
     );
-  }
+    assert_eq!(reduce(app(lam(var(0), int(2)), int(1))), int(2));
 
-  #[test]
-  fn test_reduce_nil_closure() {
-    assert_eq!(reduce(&App(nil(), nil())), Nil);
-    assert_eq!(reduce(&App(nil(), int(1))), Int(1));
-    assert_eq!(reduce(&App(nil(), var(0))), Var(0));
-    assert_eq!(reduce(&App(nil(), lam(int(1)))), Lam(int(1)));
-    assert_eq!(reduce(&App(nil(), def(int(1), nil()))), Def(int(1), nil()));
-    assert_eq!(reduce(&App(nil(), app(int(1), nil()))), App(int(1), nil()));
-    assert_eq!(
-      reduce(&App(nil(), arr(nil(), vec![]))),
-      Arr(nil(), Rc::new(vec![]))
-    );
-  }
-
-  #[test]
-  fn test_reduce_closure_constant() {
-    let env = def(int(1), nil());
-    assert_eq!(reduce(&App(env.clone(), nil())), Nil);
-    assert_eq!(reduce(&App(env.clone(), int(1))), Int(1));
-  }
-
-  #[test]
-  fn test_reduce_variable_lookup() {
     let env = def(int(1), def(int(2), nil()));
-    assert_eq!(reduce(&App(env.clone(), var(0))), Int(1));
-    assert_eq!(reduce(&App(env.clone(), var(1))), Int(2));
-    assert_eq!(reduce(&App(env.clone(), var(2))), Var(0));
-    assert_eq!(reduce(&App(env.clone(), var(3))), Var(1));
-  }
-
-  #[test]
-  fn test_reduce_closure_propagation() {
-    let env1 = def(int(1), nil());
-    let env2 = def(int(2), nil());
+    assert_eq!(reduce(app(env.clone(), nil())), nil());
+    assert_eq!(reduce(app(env.clone(), int(3))), int(3));
+    assert_eq!(reduce(app(env.clone(), var(0))), int(1));
+    assert_eq!(reduce(app(env.clone(), var(1))), int(2));
+    assert_eq!(reduce(app(env.clone(), var(2))), var(0));
     assert_eq!(
-      reduce(&App(env1.clone(), lam(int(2)))),
-      Lam(app(env1.clone(), int(2)))
+      reduce(app(env.clone(), lam(nil(), int(3)))),
+      lam(app(env.clone(), nil()), int(3))
     );
     assert_eq!(
-      reduce(&App(env1.clone(), env2.clone())),
-      Def(app(env1.clone(), int(2)), app(env1.clone(), nil()))
+      reduce(app(env.clone(), app(int(1), int(2)))),
+      app(app(env.clone(), int(1)), app(env.clone(), int(2)))
     );
+    let env2 = def(int(3), def(int(4), nil()));
     assert_eq!(
-      reduce(&App(env1.clone(), arr(env2.clone(), vec![]))),
-      Arr(app(env1.clone(), env2.clone()), Rc::new(vec![]))
+      reduce(app(env.clone(), env2.clone())),
+      def(
+        app(env.clone(), int(3)),
+        app(env.clone(), def(int(4), nil()))
+      )
     );
+
+    assert_eq!(reduce(app(jmp![int(1), int(2)], ctr(0))), int(1));
+    assert_eq!(reduce(app(jmp![int(1), int(2)], ctr(1))), int(2));
+
+    assert_eq!(reduce(add(int(1), int(2))), int(3));
+    assert_eq!(reduce(sub(int(1), int(2))), int(-1));
+    assert_eq!(reduce(mul(int(1), int(2))), int(2));
   }
 
   #[test]
-  fn test_reduce_closure_application() {
-    let env = def(lam(var(0)), nil());
-    assert_eq!(reduce(&App(env.clone(), app(var(0), int(1)))), Int(1));
+  fn test_show() {
+    assert_eq!(nil().show(), "_");
+    assert_eq!(int(1).show(), "1");
+    assert_eq!(ctr(0).show(), "#0");
+    assert_eq!(var(0).show(), "%0");
+    assert_eq!(app(nil(), int(1)).show(), "(_ 1)");
+    assert_eq!(lam(nil(), int(1)).show(), "(\\_ 1)");
+    assert_eq!(def(nil(), int(1)).show(), "{_ 1}");
+    assert_eq!(jmp![].show(), "[]");
+    assert_eq!(jmp![int(1)].show(), "[1]");
+    assert_eq!(jmp![int(1), int(2)].show(), "[1, 2]");
+    assert_eq!(jmp![int(1), int(2), int(3)].show(), "[1, 2, 3]");
   }
 
   #[test]
-  fn test_reduce_beta_reduction() {
-    assert_eq!(reduce(&App(lam(var(0)), int(1))), Int(1));
-  }
-
-  #[test]
-  fn test_reduce_branch() {
-    let arr = arr(def(int(3), nil()), vec![int(1), int(2), var(0)]);
-    assert_eq!(reduce(&App(arr.clone(), int(0))), Int(1));
-    assert_eq!(reduce(&App(arr.clone(), int(1))), Int(2));
-    assert_eq!(reduce(&App(arr.clone(), int(2))), Int(3));
+  fn test_factorial() {
+    // f 0 = 1
+    // f n = n * f (n - 1)
   }
 }
