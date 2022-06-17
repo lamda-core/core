@@ -1,54 +1,59 @@
 use std::rc::Rc;
 
-// High-order VM: https://github.com/Kindelia/HVM
-// Closure calculus: https://dl.acm.org/doi/pdf/10.1145/3294032.3294085
+// Closure calculus:
 //      https://blog.chewxy.com/wp-content/uploads/personal/dissertation31482.pdf
 
+// TODO: Optimizations and experiments
+// - Optimal reduction (evaluate each expression only once, share common subexpressions)
+// - Custom memory allocation
+// - Custom reference counting
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum Expr {
+pub enum Term {
   Nil,                              // Empty expression
   Int(i64),                         // Integer value           42
   Ctr(usize),                       // Constructor index       #0
-  Var(usize),                       // DeBruijn variable       %0
-  Def(Rc<Expr>, Rc<Expr>),          // Definition              {a, b}
-  App(Rc<Expr>, Rc<Expr>),          // Application             a b
-  Lam(Rc<Expr>, Rc<Expr>),          // Lamda closure           \a. b
-  Jmp(Rc<Expr>, Rc<Vec<Rc<Expr>>>), // Lamda closure           #a. [b1 | b2 | ..]
+  Var(usize),                       // DeBruijn variable       &0
+  Def(Rc<Term>, Rc<Term>),          // Definition              {a, b}
+  App(Rc<Term>, Rc<Term>),          // Application             a b
+  Lam(Rc<Term>, Rc<Term>),          // Lamda closure           \{}. a
+  Jmp(Rc<Term>, Rc<Vec<Rc<Term>>>), // Jump branch             #{}. [a1 | a2 | ..]
   Op2(BinaryOp),                    // Binary operator         +
   Fix,                              // Fixed point recursion   @
 }
-use Expr::*;
+use Term::*;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BinaryOp {
   Add,
   Sub,
   Mul,
+  Eq,
 }
 use BinaryOp::*;
 
-fn nil() -> Rc<Expr> {
+pub fn nil() -> Rc<Term> {
   Rc::new(Nil)
 }
-fn ctr(i: usize) -> Rc<Expr> {
+pub fn ctr(i: usize) -> Rc<Term> {
   Rc::new(Ctr(i))
 }
-fn var(i: usize) -> Rc<Expr> {
+pub fn var(i: usize) -> Rc<Term> {
   Rc::new(Var(i))
 }
-fn int(i: i64) -> Rc<Expr> {
+pub fn int(i: i64) -> Rc<Term> {
   Rc::new(Int(i))
 }
-fn def(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+pub fn def(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
   Rc::new(Def(a, b))
 }
-fn app(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+pub fn app(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
   Rc::new(App(a, b))
 }
-fn lam(env: Rc<Expr>, body: Rc<Expr>) -> Rc<Expr> {
+pub fn lam(env: Rc<Term>, body: Rc<Term>) -> Rc<Term> {
   Rc::new(Lam(env, body))
 }
-fn jmp(env: Rc<Expr>, cases: Rc<Vec<Rc<Expr>>>) -> Rc<Expr> {
+pub fn jmp(env: Rc<Term>, cases: Rc<Vec<Rc<Term>>>) -> Rc<Term> {
   Rc::new(Jmp(env, cases))
 }
 macro_rules! jmp {
@@ -56,26 +61,29 @@ macro_rules! jmp {
     Rc::new(Jmp($env, Rc::new($cases.to_vec())))
   };
 }
-fn add(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+pub fn add(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
   app(app(Rc::new(Op2(Add)), a), b)
 }
-fn sub(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+pub fn sub(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
   app(app(Rc::new(Op2(Sub)), a), b)
 }
-fn mul(a: Rc<Expr>, b: Rc<Expr>) -> Rc<Expr> {
+pub fn mul(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
   app(app(Rc::new(Op2(Mul)), a), b)
 }
-fn fix(a: Rc<Expr>) -> Rc<Expr> {
+pub fn eq(a: Rc<Term>, b: Rc<Term>) -> Rc<Term> {
+  app(app(Rc::new(Op2(Eq)), a), b)
+}
+pub fn fix(a: Rc<Term>) -> Rc<Term> {
   app(Rc::new(Fix), a)
 }
 
-impl Expr {
-  fn show(&self) -> String {
+impl Term {
+  pub fn show(&self) -> String {
     match self {
       Nil => String::from(""),
       Int(i) => i.to_string(),
       Ctr(i) => format!("#{i}"),
-      Var(i) => format!("%{i}"),
+      Var(i) => format!("&{i}"),
       Def(a, b) => match b.as_ref() {
         Nil => format!("{{{}}}", a.show()),
         _ => format!("{{{}, {}}}", a.show(), b.show()),
@@ -94,11 +102,12 @@ impl Expr {
       Op2(Add) => String::from("+"),
       Op2(Sub) => String::from("-"),
       Op2(Mul) => String::from("*"),
+      Op2(Eq) => String::from("=="),
     }
   }
 }
 
-fn reduce(expr: Rc<Expr>) -> Rc<Expr> {
+pub fn reduce(expr: Rc<Term>) -> Rc<Term> {
   match expr.as_ref() {
     App(a, b) => {
       let a = reduce(a.clone());
@@ -120,6 +129,8 @@ fn reduce(expr: Rc<Expr>) -> Rc<Expr> {
           (Op2(Add), Int(i), Int(j)) => int(i + j),
           (Op2(Sub), Int(i), Int(j)) => int(i - j),
           (Op2(Mul), Int(i), Int(j)) => int(i * j),
+          (Op2(Eq), Int(i), Int(j)) if i == j => ctr(1),
+          (Op2(Eq), Int(_), Int(_)) => ctr(0),
           _ => app(a, b),
         },
         (Lam(a1, a2), _) => reduce(app(def(b, a1.clone()), a2.clone())),
@@ -141,7 +152,7 @@ mod tests {
     assert_eq!(nil().show(), "");
     assert_eq!(int(1).show(), "1");
     assert_eq!(ctr(0).show(), "#0");
-    assert_eq!(var(0).show(), "%0");
+    assert_eq!(var(0).show(), "&0");
     assert_eq!(def(int(1), nil()).show(), "{1}");
     assert_eq!(def(int(1), def(int(2), nil())).show(), "{1, {2}}");
     assert_eq!(app(ctr(0), int(1)).show(), "(#0 1)");
@@ -216,7 +227,7 @@ mod tests {
     );
 
     // @ (λf. λ{f=f}x. x) 1
-    // @ (λ. λ{%0}x. x) 1
+    // @ (λ. λ{&0}x. x) 1
     // --------
     // {f = @ (λf. λ{f=f}x. x)} (λ{f=f}x. x) 1
     // (λ{f = @ (λf. λ{f=f}x. x), f=f}x. x)
@@ -277,7 +288,7 @@ mod tests {
     );
 
     // (False -> 0 | True -> 1) #0
-    // (λ. [0, 1] %0) #0
+    // (λ. [0, 1] &0) #0
     // ---------------------------
     // 0
     assert_eq!(
@@ -289,7 +300,7 @@ mod tests {
     );
 
     // (False -> 0 | True -> 1) #0
-    // (λ. [0, 1] %0) #1
+    // (λ. [0, 1] &0) #1
     // ---------------------------
     // 1
     assert_eq!(
@@ -308,7 +319,7 @@ mod tests {
     //
     // f = @ (λf. False -> 42 | True -> f False)
     // f = @ (λf. λ{f=f}x. {x=x, f=f} [42, f #0] x)
-    // f = @ (λ. λ{%0}. [42, %1 #0] %0)
+    // f = @ (λ. λ{&0}. [42, &1 #0] &0)
     let f = fix(lam(
       nil(),
       lam(
@@ -332,6 +343,64 @@ mod tests {
     // f n = n * f (n - 1)
     //
     // f = @ (λf. (0 -> 1 | n -> n * f (n - 1)))
-    // f = @ (λ. #{%0}. [1 | %0 * %1 (- %0 1)])
+    // f = @ (λ. λ{&0}. (#{&0, &1}. [&0 * &1 (- &0 1) | 1]) (== &0 0))
+    let f = fix(lam(
+      nil(),
+      lam(
+        def(var(0), nil()),
+        app(
+          jmp!(
+            def(var(0), def(var(1), nil())),
+            [mul(var(0), app(var(1), sub(var(0), int(1)))), int(1)]
+          ),
+          eq(var(0), int(0)),
+        ),
+      ),
+    ));
+    assert_eq!(reduce(app(f.clone(), int(0))), int(1));
+    assert_eq!(reduce(app(f.clone(), int(1))), int(1));
+    assert_eq!(reduce(app(f.clone(), int(2))), int(2));
+    assert_eq!(reduce(app(f.clone(), int(3))), int(6));
+    assert_eq!(reduce(app(f.clone(), int(4))), int(24));
+    assert_eq!(reduce(app(f.clone(), int(5))), int(120));
+  }
+
+  #[test]
+  fn test_ackermann() {
+    // a 0 n = n + 1
+    // a m 0 = a (m - 1) 1
+    // a m n = a (m - 1) (a m (n - 1))
+    //
+    // a = @ (λ. (#{&0}. [λ. + &0 1 | λ{&0, &1}. (#{&0, &1, &2}. [&2 (- &1 1) 1 | &2 (- &1 1) (&2 &1 (- &0 1))]) (== &0 0)]) (== &0 0))
+    let f = fix(lam(
+      nil(),
+      app(
+        jmp!(
+          def(var(0), nil()),
+          [
+            lam(nil(), add(var(0), int(1))),
+            lam(
+              def(var(0), def(var(1), nil())),
+              app(
+                jmp!(
+                  def(var(0), def(var(1), def(var(2), nil()))),
+                  [
+                    app(app(var(2), sub(var(1), int(1))), int(1)),
+                    app(
+                      app(var(2), sub(var(1), int(1))),
+                      app(app(var(2), var(1)), sub(var(0), int(1)))
+                    ),
+                  ]
+                ),
+                eq(var(0), int(0))
+              )
+            ),
+          ]
+        ),
+        eq(var(0), int(0)),
+      ),
+    ));
+    // assert_eq!(reduce(app(f.clone(), int(0))), int(1));
+    // Test: ack 3 12 -- https://course.ccs.neu.edu/cs5010f17/Efficiency2/ackermann5b.html?
   }
 }
